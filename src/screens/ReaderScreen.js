@@ -3,8 +3,8 @@ import { View, StyleSheet, TouchableOpacity, Text, ActivityIndicator, KeyboardAv
 import { WebView } from 'react-native-webview';
 import * as FileSystem from 'expo-file-system/legacy';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import * as Speech from 'expo-speech';
 import { Audio } from 'expo-av';
+import Tts from 'react-native-tts';
 import NotebookPanel from '../components/NotebookSheet';
 import { updateLastReadCfi } from '../database/db';
 import TOCModal from '../components/TOCModal';
@@ -32,14 +32,7 @@ export default function ReaderScreen({ route, navigation }) {
   const [speechRate, setSpeechRate] = useState(1.0);
   const [showTTSOverlay, setShowTTSOverlay] = useState(false);
   const currentCfi = useRef(null);
-  
-  // TTS Android Estimation Refs
-  const isSpeakingRef = useRef(false);
-  const isPausedRef = useRef(false);
-  const ttsInterval = useRef(null);
-  const ttsStartTime = useRef(0);
-  const ttsTotalPausedMs = useRef(0);
-  const ttsLastPauseStart = useRef(0);
+  const ttsTextRef = useRef('');
   
   // Animation for the toolbar and back button
   const controlsAnim = useRef(new Animated.Value(0)).current; // 0 = visible, 1 = hidden
@@ -76,11 +69,61 @@ export default function ReaderScreen({ route, navigation }) {
           console.warn("Failed to set audio mode", e);
        }
     };
-    configureAudio();
+    // Initialize react-native-tts
+    Tts.getInitStatus().then(() => {
+      Tts.setDefaultLanguage('en-US');
+      Tts.setDefaultRate(speechRate);
+      console.log("[TTS] Native Engine Ready");
+    }).catch((err) => {
+      if (err.code === 'no_engine') {
+        Tts.requestInstallEngine();
+      }
+      console.error("[TTS] Init Error:", err);
+    });
+
+    // Native word boundary events from Android's UtteranceProgressListener.onRangeStart
+    const progressSub = Tts.addEventListener('tts-progress', (event) => {
+      // Android often uses 'start'/'end', while iOS uses 'location'/'length'
+      const start = event.location !== undefined ? event.location : event.start;
+      const end = event.end !== undefined ? event.end : (start + (event.length || 0));
+      const length = event.length !== undefined ? event.length : (end - start);
+
+      console.log(`[TTS Progress] Raw:`, JSON.stringify(event));
+      console.log(`[TTS Progress] Normalized -> start: ${start}, length: ${length}`);
+
+      if (start !== undefined && length !== undefined && webViewRef.current) {
+        webViewRef.current.injectJavaScript(
+          `if (window.highlightWordOnPage) { highlightWordOnPage(${start}, ${length}); } true;`
+        );
+      }
+    });
+
+    const startSub = Tts.addEventListener('tts-start', () => {
+       console.log("[TTS] Audio Started");
+    });
+
+    const finishSub = Tts.addEventListener('tts-finish', () => {
+      console.log("[TTS] Audio Finished");
+      setSpeakingState(false);
+      setPausedState(false);
+      if (webViewRef.current) {
+        webViewRef.current.injectJavaScript('clearHighlights(); true;');
+      }
+    });
+
+    const cancelSub = Tts.addEventListener('tts-cancel', () => {
+      setSpeakingState(false);
+      setPausedState(false);
+      if (webViewRef.current) {
+        webViewRef.current.injectJavaScript('clearHighlights(); true;');
+      }
+    });
 
     return () => {
-       Speech.stop();
-       if (ttsInterval.current) clearInterval(ttsInterval.current);
+       Tts.stop();
+       progressSub?.remove();
+       finishSub?.remove();
+       cancelSub?.remove();
     };
   }, []);
 
@@ -125,12 +168,10 @@ export default function ReaderScreen({ route, navigation }) {
           background: #FAF6F0; 
         }
         #viewer { width: 100vw; height: 100vh; }
-        .speech-highlight {
-           background-color: #f1c40f !important;
-           color: #000 !important;
-           border-radius: 2px;
-           box-shadow: 0 0 4px rgba(241, 196, 15, 0.5);
-           transition: background 0.1s;
+        
+        ::highlight(tts-word) {
+          background-color: #f1c40f;
+          color: #000;
         }
       </style>
     </head>
@@ -147,6 +188,8 @@ export default function ReaderScreen({ route, navigation }) {
 
           var book = ePub();
           var rendition;
+          var currentPageCfiRange = null;
+          var currentUtterance = null;
           
           function init(base64Data, lastCfi) {
              book.open(base64Data, "base64");
@@ -166,8 +209,12 @@ export default function ReaderScreen({ route, navigation }) {
                  'line-height': '1.8 !important',
                  'padding': '0 8px !important'
                },
-               'a': { 'color': '#8B6914 !important' }
-             });
+                'a': { 'color': '#8B6914 !important' },
+                '::highlight(tts-word)': {
+                  'background-color': '#f1c40f !important',
+                  'color': '#000 !important'
+                }
+              });
 
              var display = rendition.display(lastCfi || undefined);
              
@@ -196,51 +243,108 @@ export default function ReaderScreen({ route, navigation }) {
              });
           }
 
-          function highlightWord(charIndex, charLength) {
-              const contents = rendition.getContents()[0];
-              if (!contents) return;
-
-              // Clear previous
-              const existing = contents.document.querySelectorAll('.speech-highlight');
-              existing.forEach(el => {
-                const parent = el.parentNode;
-                while(el.firstChild) parent.insertBefore(el.firstChild, el);
-                parent.removeChild(el);
-              });
-              contents.document.normalize();
-
-              // Find word at charIndex
-              let textNodes = [];
-              let walker = contents.document.createTreeWalker(contents.document.body, NodeFilter.SHOW_TEXT, null, false);
-              let node;
-              while(node = walker.nextNode()) textNodes.push(node);
-
-              let currentTotal = 0;
-              for (let i = 0; i < textNodes.length; i++) {
-                let node = textNodes[i];
-                let nodeLength = node.textContent.length;
-                if (currentTotal + nodeLength > charIndex) {
-                  let startInNode = charIndex - currentTotal;
-                  let range = contents.document.createRange();
-                  
-                  // Handle if word spans multiple nodes (unlikely for a single word, but possible)
-                  range.setStart(node, startInNode);
-                  range.setEnd(node, Math.min(startInNode + charLength, nodeLength));
-                  
-                  let span = contents.document.createElement('span');
-                  span.className = 'speech-highlight';
-                  range.surroundContents(span);
-                  
-                  // Check if off-screen (rough check)
-                  let rect = span.getBoundingClientRect();
-                  if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) {
-                     // Note: we might need a scroll here for very long continuous flows
-                  }
-                  break;
-                }
-                currentTotal += nodeLength;
+           function clearHighlights() {
+              var contents = rendition.getContents()[0];
+              if (contents && contents.window.CSS && contents.window.CSS.highlights) {
+                contents.window.CSS.highlights.clear();
               }
            }
+
+           function highlightWordOnPage(wordStartIndex, wordLength) {
+              if (!currentPageCfiRange) return;
+              var contents = rendition.getContents()[0];
+              if (!contents) return;
+              var doc = contents.document;
+
+               // Use Custom Highlight API for non-destructive highlighting
+               if (!contents.window.CSS || !contents.window.CSS.highlights) {
+                  window.ReactNativeWebView.postMessage(JSON.stringify({ 
+                    type: 'debug', 
+                    data: 'CSS Highlights API not supported in this WebView' 
+                  }));
+                  return;
+               }
+
+               // Get the live DOM Range of the visible page
+               var pageRange;
+               try {
+                  pageRange = contents.range(currentPageCfiRange);
+               } catch(e) {
+                  return;
+               }
+               if (!pageRange) return;
+
+               // TreeWalker bounded by the page range common ancestor
+               var walker = doc.createTreeWalker(
+                  pageRange.commonAncestorContainer,
+                  NodeFilter.SHOW_TEXT,
+                  null,
+                  false
+               );
+
+               // Fast-forward to the page start node
+               walker.currentNode = pageRange.startContainer;
+
+               var currentTotalCount = 0;
+               var startNode = null;
+               var sOffset = 0;
+               var endNode = null;
+               var eOffset = 0;
+
+               var node = walker.currentNode;
+               while (node) {
+                  var isFirstNode = (node === pageRange.startContainer);
+                  var isLastNode = (node === pageRange.endContainer);
+
+                  var nodeTextStart = isFirstNode ? pageRange.startOffset : 0;
+                  var nodeTextEnd = isLastNode ? pageRange.endOffset : node.nodeValue.length;
+                  var nodeTextLength = nodeTextEnd - nodeTextStart;
+
+                  if (!startNode && currentTotalCount + nodeTextLength > wordStartIndex) {
+                     startNode = node;
+                     sOffset = nodeTextStart + (wordStartIndex - currentTotalCount);
+                  }
+
+                  if (startNode && !endNode && currentTotalCount + nodeTextLength >= wordStartIndex + wordLength) {
+                     endNode = node;
+                     eOffset = nodeTextStart + ((wordStartIndex + wordLength) - currentTotalCount);
+                     break;
+                  }
+
+                  currentTotalCount += nodeTextLength;
+                  if (isLastNode) break;
+                  node = walker.nextNode();
+               }
+
+               if (startNode && endNode) {
+                  try {
+                    var wordRange = doc.createRange();
+                    wordRange.setStart(startNode, sOffset);
+                    wordRange.setEnd(endNode, eOffset);
+                    
+                    var highlight = new contents.window.Highlight(wordRange);
+                    contents.window.CSS.highlights.set('tts-word', highlight);
+                    
+                    // Log to RN to confirm success
+                    window.ReactNativeWebView.postMessage(JSON.stringify({ 
+                      type: 'debug', 
+                      data: 'Highlight applied for index ' + wordStartIndex 
+                    }));
+                  } catch(e) {
+                     window.ReactNativeWebView.postMessage(JSON.stringify({ 
+                       type: 'debug', 
+                       data: 'Highlight failed: ' + e.toString() 
+                     }));
+                  }
+               } else {
+                 window.ReactNativeWebView.postMessage(JSON.stringify({ 
+                   type: 'debug', 
+                   data: 'Nodes not found for index ' + wordStartIndex 
+                 }));
+              }
+           }
+
+
 
            function handleMessage(messageStr) {
             var msg = JSON.parse(messageStr);
@@ -264,7 +368,6 @@ export default function ReaderScreen({ route, navigation }) {
                       var startCfi = location.start.cfi;
                       var endCfi = location.end.cfi;
 
-                      // Parse CFI: strip "epubcfi(" prefix and ")" suffix, split on "!"
                       var PREFIX = "epubcfi(";
                       function parseCfi(cfi) {
                          if (cfi.indexOf(PREFIX) !== 0) return null;
@@ -278,8 +381,6 @@ export default function ReaderScreen({ route, navigation }) {
                       var endParts = parseCfi(endCfi);
                       if (!startParts || !endParts) return "";
 
-                      // Find common parent path between startPath and endPath
-                      // Split by "/" and compare segments
                       var startSegs = startParts.path.split("/");
                       var endSegs = endParts.path.split("/");
                       var commonSegs = [];
@@ -294,36 +395,21 @@ export default function ReaderScreen({ route, navigation }) {
                       var startSuffix = "/" + startSegs.slice(commonSegs.length).join("/");
                       var endSuffix = "/" + endSegs.slice(commonSegs.length).join("/");
 
-                      // Build proper 3-part CFI range: epubcfi(base!commonParent,startSuffix,endSuffix)
                       var cfiRange = "epubcfi(" + startParts.base + "!" + commonPath + "," + startSuffix + "," + endSuffix + ")";
 
-                      window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'DEBUG cfiRange: ' + cfiRange }));
+                      // Store for highlighting
+                      currentPageCfiRange = cfiRange;
 
                       try {
                          var range = await book.getRange(cfiRange);
                          if (range) {
-                             var rawText = range.toString();
-                             window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'DEBUG text length: ' + rawText.length + ' preview: ' + rawText.substring(0, 80) }));
-                             if (rawText.trim().length > 0) {
-                                return rawText.trim();
-                             }
+                              var rawText = range.toString();
+                              if (rawText.length > 0) {
+                                 return rawText;
+                              }
                          }
                       } catch(e) {
-                         window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'getRange failed: ' + e.toString() }));
-                      }
-
-                      // Fallback: grab text from the live rendered contents document
-                      try {
-                         var contents = rendition.getContents();
-                         if (contents && contents.length > 0 && contents[0].document && contents[0].document.body) {
-                            var bodyText = contents[0].document.body.innerText || contents[0].document.body.textContent || "";
-                            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'DEBUG fallback bodyText length: ' + bodyText.length }));
-                            if (bodyText.trim().length > 0) {
-                               return bodyText.trim();
-                            }
-                         }
-                      } catch(e2) {
-                         window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'Fallback failed: ' + e2.toString() }));
+                         // CFI range extraction failed
                       }
 
                       return "";
@@ -335,8 +421,6 @@ export default function ReaderScreen({ route, navigation }) {
                       window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'chapterText', text: "", isTTS: msg.isTTS }));
                   });
                   
-              } else if (msg.type === 'highlightWord') {
-                  highlightWord(msg.index, msg.length);
               }
            }
         } catch(e) {
@@ -361,10 +445,17 @@ export default function ReaderScreen({ route, navigation }) {
         currentCfi.current = data.cfi;
       } else if (data.type === 'chapterText') {
         if (data.isTTS) {
-           startSpeaking(data.text);
+           const text = data.text || '';
+           ttsTextRef.current = text;
+           Tts.setDefaultRate(speechRate);
+           Tts.speak(text);
+           setSpeakingState(true);
+           setPausedState(false);
         } else {
            setChapterText(data.text);
         }
+      } else if (data.type === 'debug') {
+        console.log("[WebView Debug]", data.data);
       }
     } catch (e) {
       // Ignored
@@ -383,79 +474,24 @@ export default function ReaderScreen({ route, navigation }) {
 
   const setSpeakingState = (val) => {
      setIsSpeaking(val);
-     isSpeakingRef.current = val;
   };
   
   const setPausedState = (val) => {
      setIsPaused(val);
-     isPausedRef.current = val;
   };
 
   const handleNext = () => webViewRef.current?.postMessage(JSON.stringify({ type: 'next' }));
   const handlePrev = () => webViewRef.current?.postMessage(JSON.stringify({ type: 'prev' }));
   const toggleControls = () => setShowControls(!showControls);
 
-  const startSpeaking = async (text) => {
-    Speech.stop();
-    if (ttsInterval.current) clearInterval(ttsInterval.current);
-    
-    setSpeakingState(true);
-    setPausedState(false);
-
-    try {
-      const voices = await Speech.getAvailableVoicesAsync();
-      console.log("[TTS] Available voices count:", voices.length);
-      if (voices.length === 0) {
-        Alert.alert(
-          "TTS Engine Missing",
-          "No speech voices were found. If you are using an Android emulator, you need to download a TTS engine (like Google TTS) from the Play Store."
-        );
-        setSpeakingState(false);
-        return;
-      }
-    } catch(err) {
-      console.warn("[TTS] Failed checking voices", err);
-    }
-    
-    let textToSpeak = text;
-    if (!textToSpeak || typeof textToSpeak !== 'string' || textToSpeak.trim() === '') {
-       textToSpeak = "I could not extract text from this page. It might be blank or an image.";
-    }
-
-    if (textToSpeak.length > 3500) {
-       textToSpeak = textToSpeak.substring(0, 3500) + "...";
-    }
-
-    console.log("[TTS] Attempting to speak string of length:", textToSpeak.length);
-
-    // Simple plain reading without highlighting sync
-    Speech.speak(textToSpeak, {
-      rate: speechRate,
-      language: 'en-US',
-      onDone: () => setSpeakingState(false),
-      onStopped: () => setSpeakingState(false),
-      onError: (err) => {
-         console.error("[TTS Error]", err);
-         Alert.alert("Playback failed", "The text-to-speech engine crashed or was interrupted. " + (err ? err.toString() : ""));
-         setSpeakingState(false);
-      }
-    });
-  };
-
   const toggleTTS = () => {
     if (isSpeaking) {
       if (isPaused) {
-        Speech.resume();
+        Tts.resume();
         setPausedState(false);
-        if (Platform.OS === 'android' && ttsLastPauseStart.current > 0) {
-            ttsTotalPausedMs.current += (Date.now() - ttsLastPauseStart.current);
-        }
       } else {
-        Speech.pause();
+        Tts.pause();
         setPausedState(true);
-        if (Platform.OS === 'android') {
-            ttsLastPauseStart.current = Date.now();
-        }
       }
     } else {
        webViewRef.current?.postMessage(JSON.stringify({ type: 'getChapterText', isTTS: true }));
@@ -464,19 +500,18 @@ export default function ReaderScreen({ route, navigation }) {
   };
 
   const stopTTS = () => {
-    Speech.stop();
+    Tts.stop();
     setSpeakingState(false);
     setPausedState(false);
     setShowTTSOverlay(false);
-    if (ttsInterval.current) clearInterval(ttsInterval.current);
+    webViewRef.current?.injectJavaScript('clearHighlights(); true;');
   };
 
   const changeRate = (newRate) => {
      setSpeechRate(newRate);
      if (isSpeaking) {
-        // or just let it finish and next one will be new rate.
-        // Actually Speech.stop/start is safer.
-        Speech.stop();
+        Tts.stop();
+        Tts.setDefaultRate(newRate);
         webViewRef.current?.postMessage(JSON.stringify({ type: 'getChapterText', isTTS: true }));
      }
   };
