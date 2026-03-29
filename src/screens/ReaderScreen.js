@@ -1,12 +1,16 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { View, StyleSheet, TouchableOpacity, Text, ActivityIndicator, KeyboardAvoidingView, Platform, Animated } from 'react-native';
+import { View, StyleSheet, TouchableOpacity, Text, ActivityIndicator, KeyboardAvoidingView, Platform, Animated, Alert } from 'react-native';
 import { WebView } from 'react-native-webview';
 import * as FileSystem from 'expo-file-system/legacy';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as Speech from 'expo-speech';
+import { Audio } from 'expo-av';
 import NotebookPanel from '../components/NotebookSheet';
 import { updateLastReadCfi } from '../database/db';
 import TOCModal from '../components/TOCModal';
 import AIChatModal from '../components/AIChatModal';
+import { Ionicons } from '@expo/vector-icons';
+
 
 export default function ReaderScreen({ route, navigation }) {
   const { book } = route.params;
@@ -22,8 +26,24 @@ export default function ReaderScreen({ route, navigation }) {
   const [chapterText, setChapterText] = useState('');
   const [showControls, setShowControls] = useState(true);
   
+  // TTS State
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [speechRate, setSpeechRate] = useState(1.0);
+  const [showTTSOverlay, setShowTTSOverlay] = useState(false);
+  const currentCfi = useRef(null);
+  
+  // TTS Android Estimation Refs
+  const isSpeakingRef = useRef(false);
+  const isPausedRef = useRef(false);
+  const ttsInterval = useRef(null);
+  const ttsStartTime = useRef(0);
+  const ttsTotalPausedMs = useRef(0);
+  const ttsLastPauseStart = useRef(0);
+  
   // Animation for the toolbar and back button
   const controlsAnim = useRef(new Animated.Value(0)).current; // 0 = visible, 1 = hidden
+  const ttsOverlayAnim = useRef(new Animated.Value(0)).current; 
 
   useEffect(() => {
     Animated.timing(controlsAnim, {
@@ -32,6 +52,37 @@ export default function ReaderScreen({ route, navigation }) {
       useNativeDriver: true,
     }).start();
   }, [showControls]);
+
+  useEffect(() => {
+    Animated.spring(ttsOverlayAnim, {
+      toValue: showTTSOverlay ? 1 : 0,
+      useNativeDriver: true,
+      friction: 8,
+      tension: 40
+    }).start();
+  }, [showTTSOverlay]);
+
+  useEffect(() => {
+    const configureAudio = async () => {
+       try {
+          await Audio.setAudioModeAsync({
+             playsInSilentModeIOS: true,
+             allowsRecordingIOS: false,
+             staysActiveInBackground: true,
+             shouldDuckAndroid: true,
+             playThroughEarpieceAndroid: false,
+          });
+       } catch (e) {
+          console.warn("Failed to set audio mode", e);
+       }
+    };
+    configureAudio();
+
+    return () => {
+       Speech.stop();
+       if (ttsInterval.current) clearInterval(ttsInterval.current);
+    };
+  }, []);
 
   useEffect(() => {
     navigation.setOptions({ title: book.title.replace('.epub', '') });
@@ -74,6 +125,13 @@ export default function ReaderScreen({ route, navigation }) {
           background: #FAF6F0; 
         }
         #viewer { width: 100vw; height: 100vh; }
+        .speech-highlight {
+           background-color: #f1c40f !important;
+           color: #000 !important;
+           border-radius: 2px;
+           box-shadow: 0 0 4px rgba(241, 196, 15, 0.5);
+           transition: background 0.1s;
+        }
       </style>
     </head>
     <body>
@@ -138,7 +196,53 @@ export default function ReaderScreen({ route, navigation }) {
              });
           }
 
-          function handleMessage(messageStr) {
+          function highlightWord(charIndex, charLength) {
+              const contents = rendition.getContents()[0];
+              if (!contents) return;
+
+              // Clear previous
+              const existing = contents.document.querySelectorAll('.speech-highlight');
+              existing.forEach(el => {
+                const parent = el.parentNode;
+                while(el.firstChild) parent.insertBefore(el.firstChild, el);
+                parent.removeChild(el);
+              });
+              contents.document.normalize();
+
+              // Find word at charIndex
+              let textNodes = [];
+              let walker = contents.document.createTreeWalker(contents.document.body, NodeFilter.SHOW_TEXT, null, false);
+              let node;
+              while(node = walker.nextNode()) textNodes.push(node);
+
+              let currentTotal = 0;
+              for (let i = 0; i < textNodes.length; i++) {
+                let node = textNodes[i];
+                let nodeLength = node.textContent.length;
+                if (currentTotal + nodeLength > charIndex) {
+                  let startInNode = charIndex - currentTotal;
+                  let range = contents.document.createRange();
+                  
+                  // Handle if word spans multiple nodes (unlikely for a single word, but possible)
+                  range.setStart(node, startInNode);
+                  range.setEnd(node, Math.min(startInNode + charLength, nodeLength));
+                  
+                  let span = contents.document.createElement('span');
+                  span.className = 'speech-highlight';
+                  range.surroundContents(span);
+                  
+                  // Check if off-screen (rough check)
+                  let rect = span.getBoundingClientRect();
+                  if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) {
+                     // Note: we might need a scroll here for very long continuous flows
+                  }
+                  break;
+                }
+                currentTotal += nodeLength;
+              }
+           }
+
+           function handleMessage(messageStr) {
             var msg = JSON.parse(messageStr);
             if (msg.type === 'init') {
                 init(msg.base64, msg.lastCfi);
@@ -148,15 +252,93 @@ export default function ReaderScreen({ route, navigation }) {
                 rendition.prev();
             } else if (msg.type === 'goto') {
                 rendition.display(msg.cfi);
-            } else if (msg.type === 'getChapterText') {
-                 var location = rendition.currentLocation();
-                 var section = book.spine.get(location.start.index);
-                 section.load(book.load.bind(book)).then(function(doc) {
-                    var text = (doc && doc.body) ? doc.body.textContent : (typeof doc === 'string' ? doc : "");
-                    window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'chapterText', text: text }));
-                 });
-             }
-          }
+              } else if (msg.type === 'getChapterText') {
+                  
+                  // Extract only visible page text via CFI range
+                  async function extractCurrentVisibleText() {
+                      var location = rendition.currentLocation();
+                      if (!location || !location.start || !location.end) {
+                         return "";
+                      }
+                      
+                      var startCfi = location.start.cfi;
+                      var endCfi = location.end.cfi;
+
+                      // Parse CFI: strip "epubcfi(" prefix and ")" suffix, split on "!"
+                      var PREFIX = "epubcfi(";
+                      function parseCfi(cfi) {
+                         if (cfi.indexOf(PREFIX) !== 0) return null;
+                         var inner = cfi.substring(PREFIX.length, cfi.length - 1);
+                         var bangIdx = inner.indexOf("!");
+                         if (bangIdx === -1) return null;
+                         return { base: inner.substring(0, bangIdx), path: inner.substring(bangIdx + 1) };
+                      }
+
+                      var startParts = parseCfi(startCfi);
+                      var endParts = parseCfi(endCfi);
+                      if (!startParts || !endParts) return "";
+
+                      // Find common parent path between startPath and endPath
+                      // Split by "/" and compare segments
+                      var startSegs = startParts.path.split("/");
+                      var endSegs = endParts.path.split("/");
+                      var commonSegs = [];
+                      for (var i = 0; i < Math.min(startSegs.length, endSegs.length); i++) {
+                         if (startSegs[i] === endSegs[i]) {
+                            commonSegs.push(startSegs[i]);
+                         } else {
+                            break;
+                         }
+                      }
+                      var commonPath = commonSegs.join("/");
+                      var startSuffix = "/" + startSegs.slice(commonSegs.length).join("/");
+                      var endSuffix = "/" + endSegs.slice(commonSegs.length).join("/");
+
+                      // Build proper 3-part CFI range: epubcfi(base!commonParent,startSuffix,endSuffix)
+                      var cfiRange = "epubcfi(" + startParts.base + "!" + commonPath + "," + startSuffix + "," + endSuffix + ")";
+
+                      window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'DEBUG cfiRange: ' + cfiRange }));
+
+                      try {
+                         var range = await book.getRange(cfiRange);
+                         if (range) {
+                             var rawText = range.toString();
+                             window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'DEBUG text length: ' + rawText.length + ' preview: ' + rawText.substring(0, 80) }));
+                             if (rawText.trim().length > 0) {
+                                return rawText.trim();
+                             }
+                         }
+                      } catch(e) {
+                         window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'getRange failed: ' + e.toString() }));
+                      }
+
+                      // Fallback: grab text from the live rendered contents document
+                      try {
+                         var contents = rendition.getContents();
+                         if (contents && contents.length > 0 && contents[0].document && contents[0].document.body) {
+                            var bodyText = contents[0].document.body.innerText || contents[0].document.body.textContent || "";
+                            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'DEBUG fallback bodyText length: ' + bodyText.length }));
+                            if (bodyText.trim().length > 0) {
+                               return bodyText.trim();
+                            }
+                         }
+                      } catch(e2) {
+                         window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'Fallback failed: ' + e2.toString() }));
+                      }
+
+                      return "";
+                  }
+                  
+                  extractCurrentVisibleText().then(function(text) {
+                      window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'chapterText', text: text, isTTS: msg.isTTS }));
+                  }).catch(function(e) {
+                      window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'chapterText', text: "", isTTS: msg.isTTS }));
+                  });
+                  
+              } else if (msg.type === 'highlightWord') {
+                  highlightWord(msg.index, msg.length);
+              }
+           }
         } catch(e) {
           window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: e.toString() }));
         }
@@ -176,8 +358,13 @@ export default function ReaderScreen({ route, navigation }) {
         setToc(data.data);
       } else if (data.type === 'loc') {
         updateLastReadCfi(book.id, data.cfi);
+        currentCfi.current = data.cfi;
       } else if (data.type === 'chapterText') {
-        setChapterText(data.text);
+        if (data.isTTS) {
+           startSpeaking(data.text);
+        } else {
+           setChapterText(data.text);
+        }
       }
     } catch (e) {
       // Ignored
@@ -194,9 +381,105 @@ export default function ReaderScreen({ route, navigation }) {
     }
   };
 
+  const setSpeakingState = (val) => {
+     setIsSpeaking(val);
+     isSpeakingRef.current = val;
+  };
+  
+  const setPausedState = (val) => {
+     setIsPaused(val);
+     isPausedRef.current = val;
+  };
+
   const handleNext = () => webViewRef.current?.postMessage(JSON.stringify({ type: 'next' }));
   const handlePrev = () => webViewRef.current?.postMessage(JSON.stringify({ type: 'prev' }));
   const toggleControls = () => setShowControls(!showControls);
+
+  const startSpeaking = async (text) => {
+    Speech.stop();
+    if (ttsInterval.current) clearInterval(ttsInterval.current);
+    
+    setSpeakingState(true);
+    setPausedState(false);
+
+    try {
+      const voices = await Speech.getAvailableVoicesAsync();
+      console.log("[TTS] Available voices count:", voices.length);
+      if (voices.length === 0) {
+        Alert.alert(
+          "TTS Engine Missing",
+          "No speech voices were found. If you are using an Android emulator, you need to download a TTS engine (like Google TTS) from the Play Store."
+        );
+        setSpeakingState(false);
+        return;
+      }
+    } catch(err) {
+      console.warn("[TTS] Failed checking voices", err);
+    }
+    
+    let textToSpeak = text;
+    if (!textToSpeak || typeof textToSpeak !== 'string' || textToSpeak.trim() === '') {
+       textToSpeak = "I could not extract text from this page. It might be blank or an image.";
+    }
+
+    if (textToSpeak.length > 3500) {
+       textToSpeak = textToSpeak.substring(0, 3500) + "...";
+    }
+
+    console.log("[TTS] Attempting to speak string of length:", textToSpeak.length);
+
+    // Simple plain reading without highlighting sync
+    Speech.speak(textToSpeak, {
+      rate: speechRate,
+      language: 'en-US',
+      onDone: () => setSpeakingState(false),
+      onStopped: () => setSpeakingState(false),
+      onError: (err) => {
+         console.error("[TTS Error]", err);
+         Alert.alert("Playback failed", "The text-to-speech engine crashed or was interrupted. " + (err ? err.toString() : ""));
+         setSpeakingState(false);
+      }
+    });
+  };
+
+  const toggleTTS = () => {
+    if (isSpeaking) {
+      if (isPaused) {
+        Speech.resume();
+        setPausedState(false);
+        if (Platform.OS === 'android' && ttsLastPauseStart.current > 0) {
+            ttsTotalPausedMs.current += (Date.now() - ttsLastPauseStart.current);
+        }
+      } else {
+        Speech.pause();
+        setPausedState(true);
+        if (Platform.OS === 'android') {
+            ttsLastPauseStart.current = Date.now();
+        }
+      }
+    } else {
+       webViewRef.current?.postMessage(JSON.stringify({ type: 'getChapterText', isTTS: true }));
+       setShowTTSOverlay(true);
+    }
+  };
+
+  const stopTTS = () => {
+    Speech.stop();
+    setSpeakingState(false);
+    setPausedState(false);
+    setShowTTSOverlay(false);
+    if (ttsInterval.current) clearInterval(ttsInterval.current);
+  };
+
+  const changeRate = (newRate) => {
+     setSpeechRate(newRate);
+     if (isSpeaking) {
+        // or just let it finish and next one will be new rate.
+        // Actually Speech.stop/start is safer.
+        Speech.stop();
+        webViewRef.current?.postMessage(JSON.stringify({ type: 'getChapterText', isTTS: true }));
+     }
+  };
 
   return (
     <KeyboardAvoidingView 
@@ -240,9 +523,37 @@ export default function ReaderScreen({ route, navigation }) {
             <TouchableOpacity style={styles.sideBtn} onPress={() => setShowToc(true)}><Text style={styles.sideBtnText}>☰</Text></TouchableOpacity>
             <TouchableOpacity style={[styles.sideBtn, showNotebook && styles.sideBtnActive]} onPress={() => setShowNotebook(!showNotebook)}><Text style={[styles.sideBtnText, showNotebook && styles.sideBtnTextActive]}>✎</Text></TouchableOpacity>
             <TouchableOpacity style={styles.sideBtn} onPress={() => { webViewRef.current?.postMessage(JSON.stringify({ type: 'getChapterText' })); setShowAI(true); }}><Text style={styles.sideBtnText}>✦</Text></TouchableOpacity>
+            <TouchableOpacity style={[styles.sideBtn, isSpeaking && styles.sideBtnActive]} onPress={toggleTTS}><Text style={styles.sideBtnText}>🔊</Text></TouchableOpacity>
           </Animated.View>
         </View>
       )}
+
+      {/* TTS Premium Overlay */}
+      <Animated.View style={[styles.ttsOverlay, { 
+        transform: [{ translateY: ttsOverlayAnim.interpolate({ inputRange: [0, 1], outputRange: [200, 0] }) }],
+        opacity: ttsOverlayAnim
+      }]} pointerEvents={showTTSOverlay ? 'auto' : 'none'}>
+        <View style={styles.ttsHeader}>
+           <Text style={styles.ttsTitle}>Reading Aloud</Text>
+           <TouchableOpacity onPress={stopTTS}><Ionicons name="close" size={24} color="#8B6914" /></TouchableOpacity>
+        </View>
+        
+        <View style={styles.ttsControls}>
+           <TouchableOpacity onPress={() => changeRate(Math.max(0.5, speechRate - 0.25))} style={styles.rateBtn}>
+             <Text style={styles.rateBtnText}>-</Text>
+           </TouchableOpacity>
+           
+           <TouchableOpacity onPress={toggleTTS} style={styles.playBtn}>
+             <Ionicons name={isPaused ? "play" : "pause"} size={32} color="#fff" />
+           </TouchableOpacity>
+           
+           <TouchableOpacity onPress={() => changeRate(Math.min(2.0, speechRate + 0.25))} style={styles.rateBtn}>
+             <Text style={styles.rateBtnText}>+</Text>
+           </TouchableOpacity>
+        </View>
+        
+        <Text style={styles.speedLabel}>{speechRate.toFixed(2)}x Speed</Text>
+      </Animated.View>
 
       {showNotebook && <View style={styles.notebookHalf}><NotebookPanel bookId={book.id} onClose={() => setShowNotebook(false)} /></View>}
 
@@ -271,4 +582,30 @@ const styles = StyleSheet.create({
   sideBtnActive: { backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 10 },
   sideBtnText: { color: '#FFF8F0', fontSize: 18, fontWeight: '600' },
   sideBtnTextActive: { color: '#fff' },
+  
+  // TTS Overlay Styles
+  ttsOverlay: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: '#FAF6F0',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 20,
+    paddingBottom: 40,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.1,
+    shadowRadius: 12,
+    elevation: 20,
+    zIndex: 100,
+  },
+  ttsHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 },
+  ttsTitle: { fontSize: 18, fontWeight: '700', color: '#8B6914', fontFamily: 'Georgia' },
+  ttsControls: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 30 },
+  playBtn: { width: 64, height: 64, borderRadius: 32, backgroundColor: '#8B6914', justifyContent: 'center', alignItems: 'center', shadowColor: "#8B6914", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 8 },
+  rateBtn: { width: 44, height: 44, borderRadius: 22, borderWidth: 1.5, borderColor: '#8B6914', justifyContent: 'center', alignItems: 'center' },
+  rateBtnText: { fontSize: 24, color: '#8B6914', fontWeight: '300' },
+  speedLabel: { textAlign: 'center', marginTop: 16, color: '#8B6914', fontSize: 14, fontWeight: '600', opacity: 0.8 },
 });
